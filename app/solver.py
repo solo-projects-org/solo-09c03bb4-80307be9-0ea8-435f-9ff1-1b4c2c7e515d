@@ -93,8 +93,28 @@ def solve(
     rows: Sequence[dict],
     allowed_pairs: Sequence[Tuple[str, str]],
     locks: Sequence[LockSpec],
+    quarantined_row_ids: Optional[Sequence[int]] = None,
 ) -> SolveResult:
-    """求解并做逐格最优解枚举分析。"""
+    """求解并做逐格最优解枚举分析。
+
+    隔离行（quarantined_row_ids）完全不参与建模：不产生同株/同托盘变量约束，
+    不参与允许组合约束与最少改动目标，也不出现在逐格方案中。原始行与核实值
+    由持久层保留，恢复后重新传入即可再次生效。
+    """
+    quarantined = set(quarantined_row_ids or ())
+    active_rows = [r for r in rows if r["row_id"] not in quarantined]
+    if not active_rows:
+        # 全部隔离：不存在任何待修复行，空方案不可确认（由 API 层门控）。
+        return SolveResult(
+            status="empty",
+            optimal=False,
+            total_changes=0,
+            objective_proven=False,
+            cells=[],
+            conflicts=[],
+            groups=[],
+        )
+
     varieties = sorted({v for v, _ in allowed_pairs})
     houses = sorted({h for _, h in allowed_pairs})
     v_id = {v: i for i, v in enumerate(varieties)}
@@ -102,8 +122,11 @@ def solve(
     pair_tuples = [(v_id[v], h_id[h]) for v, h in allowed_pairs]
 
     # 行内锁校验：锁定值必须在取值域内，否则直接给出冲突。
+    # 隔离行的锁不参与求解，跳过其校验（数据本身仍保留在数据库中）。
     lock_by_cell: Dict[Tuple[int, str], LockSpec] = {}
     for lk in locks:
+        if lk.row_id in quarantined:
+            continue
         target = v_id if lk.fld == "variety" else h_id
         if lk.value not in target:
             return SolveResult(
@@ -129,7 +152,7 @@ def solve(
 
     try:
         artifacts = _build_model(
-            rows, pair_tuples, v_id, h_id, lock_by_cell, with_objective=True
+            active_rows, pair_tuples, v_id, h_id, lock_by_cell, with_objective=True
         )
     except _InfeasibleStructure as exc:
         return SolveResult(
@@ -153,7 +176,7 @@ def solve(
             total_changes=None,
             objective_proven=False,
             conflicts=_explain_infeasible(
-                rows, allowed_pairs, v_id, h_id, lock_by_cell
+                active_rows, allowed_pairs, v_id, h_id, lock_by_cell
             ),
         )
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -174,7 +197,7 @@ def solve(
         primary_values[("tray", tray)] = solver.Value(var)
 
     # ---- 逐变量枚举所有最优解下的可取值 ----
-    group_defs = _group_definitions(rows)
+    group_defs = _group_definitions(active_rows)
     ach_index: Dict[Tuple[str, str], List[int]] = {}
     enum_tasks: List[Tuple[str, str, List[int], Optional[int]]] = []
     for kind, key, row_ids, fld in group_defs:
@@ -197,7 +220,7 @@ def solve(
         achievable: List[int] = []
         for val in domain:
             if _feasible_with_bound(
-                rows, pair_tuples, v_id, h_id, lock_by_cell, kind, key, val, bound
+                active_rows, pair_tuples, v_id, h_id, lock_by_cell, kind, key, val, bound
             ):
                 achievable.append(val)
         return (kind, key), achievable
@@ -211,7 +234,7 @@ def solve(
     cells: List[CellResult] = []
     id_to_v = {i: v for v, i in v_id.items()}
     id_to_h = {i: h for h, i in h_id.items()}
-    for row in rows:
+    for row in active_rows:
         rid = row["row_id"]
         for fld, kind, key, id_map in (
             ("variety", "plant", row["plant_no"], id_to_v),

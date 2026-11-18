@@ -216,3 +216,97 @@ def test_30_rows_performance_and_optimal():
     assert res.objective_proven
     assert res.total_changes is not None
     assert len(res.cells) == 60
+
+
+# ---------------------------------------------------------------- 隔离行
+def test_quarantined_rows_excluded_from_model():
+    # 行1/行2 同株 P1：行2 品种 V2 在严格允许组合下非法，原本必须把行2 改成 V1（1 格）。
+    strict_pairs = [("V1", "H1"), ("V2", "H2")]
+    rows = make_rows(
+        [
+            (1, "P1", "T1", "V1", "H1", "10"),
+            (2, "P1", "T2", "V2", "H1", "11"),
+        ]
+    )
+    res = solve(rows, strict_pairs, [], quarantined_row_ids=[2])
+    assert res.status == "optimal"
+    assert res.total_changes == 0  # 隔离后只剩合法的行1，无需改动
+    assert {c.row_id for c in res.cells} == {1}
+    assert cell(res, 1, "variety").category == "fixed_keep"
+    # 同株组里也不再包含被隔离的行2
+    plant_group = next(g for g in res.groups if g["kind"] == "plant")
+    assert plant_group["row_ids"] == [1]
+
+
+def test_quarantine_removes_tray_consistency_pressure():
+    # 同托盘两行温室冲突，原本需 1 格改动；隔离其中一行后 0 改动。
+    rows = make_rows(
+        [
+            (1, "P1", "T1", "V1", "H1", "10"),
+            (2, "P2", "T1", "V1", "H2", "11"),
+        ]
+    )
+    res = solve(rows, PAIRS, [], quarantined_row_ids=[2])
+    assert res.status == "optimal"
+    assert res.total_changes == 0
+    assert {c.row_id for c in res.cells} == {1}
+
+
+def test_quarantined_row_locks_ignored_but_retained_by_caller():
+    # 只允许 (V1,H1)：行1 锁温室 H2 直接无解；隔离行1 后其锁不参与，行2 可正常求解。
+    pairs = [("V1", "H1")]
+    rows = make_rows(
+        [
+            (1, "P1", "T1", "V1", "H1", "10"),
+            (2, "P2", "T2", "V1", "H1", "11"),
+        ]
+    )
+    locks = [LockSpec(1, "house", "H2", "candidate")]
+    blocked = solve(rows, pairs, locks)
+    assert blocked.status == "infeasible"
+    resolved = solve(rows, pairs, locks, quarantined_row_ids=[1])
+    assert resolved.status == "optimal"
+    assert {c.row_id for c in resolved.cells} == {2}
+
+
+def test_all_rows_quarantined_returns_empty_non_confirmable():
+    rows = make_rows([(1, "P1", "T1", "V1", "H1", "10")])
+    res = solve(rows, PAIRS, [], quarantined_row_ids=[1])
+    assert res.status == "empty"
+    assert res.optimal is False
+    assert res.objective_proven is False
+    assert res.cells == []
+    assert res.conflicts == []
+
+
+def test_restore_reincludes_row_with_its_lock():
+    # 不传隔离集合即“恢复”：行2 及其锁重新进入模型。
+    strict_pairs = [("V1", "H1"), ("V2", "H2")]
+    rows = make_rows(
+        [
+            (1, "P1", "T1", "V1", "H1", "10"),
+            (2, "P1", "T2", "V2", "H1", "11"),
+        ]
+    )
+    locked = solve(
+        rows,
+        strict_pairs,
+        [LockSpec(2, "variety", "V2", "candidate")],
+    )
+    assert locked.status == "optimal"
+    assert cell(locked, 2, "variety").category == "locked"
+    # 先隔离再恢复（两次调用），恢复后结果与未隔离时一致。
+    quarantined = solve(
+        rows,
+        strict_pairs,
+        [LockSpec(2, "variety", "V2", "candidate")],
+        quarantined_row_ids=[2],
+    )
+    assert {c.row_id for c in quarantined.cells} == {1}
+    restored = solve(
+        rows,
+        strict_pairs,
+        [LockSpec(2, "variety", "V2", "candidate")],
+    )
+    assert cell(restored, 2, "variety").locked_value == "V2"
+    assert restored.total_changes == locked.total_changes

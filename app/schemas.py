@@ -26,6 +26,17 @@ class LockIn(BaseModel):
     source: str = Field("candidate", pattern="^(original|candidate)$")
 
 
+class QuarantineIn(BaseModel):
+    row_id: int = Field(..., ge=1)
+    reason: str = Field(..., min_length=1, max_length=256)
+
+
+class QuarantineOut(BaseModel):
+    row_id: int
+    reason: str
+    created_at: str
+
+
 class RowOut(BaseModel):
     row_id: int
     line_no: int

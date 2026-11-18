@@ -19,7 +19,7 @@ from .parsing import (
     parse_inspection_csv,
     validate_allowed_dims,
 )
-from .schemas import AllowedPairsPayload, LockIn
+from .schemas import AllowedPairsPayload, LockIn, QuarantineIn
 from .solver import LockSpec, solve
 
 
@@ -105,6 +105,7 @@ def session_detail(sid: int) -> dict:
 def _serialize_session(sid: int, data: dict) -> dict:
     s, rows, pairs = data["session"], data["rows"], data["pairs"]
     locks = {(l["row_id"], l["field"]): l for l in data["locks"]}
+    quarantines = {q["row_id"]: q for q in data["quarantines"]}
     solution = db.get_solution(sid)
     confirmation = db.get_confirmation(sid)
     current_rev = s["revision"]
@@ -152,6 +153,8 @@ def _serialize_session(sid: int, data: dict) -> dict:
         "id": sid,
         "revision": current_rev,
         "row_count": len(rows),
+        "quarantined_count": len(quarantines),
+        "active_count": len(rows) - len(quarantines),
         "variety_count": len({v for v, _ in pairs}),
         "house_count": len({h for _, h in pairs}),
         "created_at": s["created_at"],
@@ -173,11 +176,19 @@ def _serialize_session(sid: int, data: dict) -> dict:
                 "variety_original": r["variety"],
                 "house_original": r["house"],
                 "height": r["height"],
+                "quarantined": r["row_id"] in quarantines,
+                "quarantine_reason": quarantines[r["row_id"]]["reason"]
+                if r["row_id"] in quarantines
+                else None,
+                "quarantined_at": quarantines[r["row_id"]]["created_at"]
+                if r["row_id"] in quarantines
+                else None,
             }
             for r in rows
         ],
         "allowed_pairs": [{"variety": v, "house": h} for v, h in pairs],
         "locks": data["locks"],
+        "quarantines": data["quarantines"],
         "cells": cells,
         "conflicts": conflicts_out,
         "groups": groups,
@@ -227,6 +238,35 @@ def remove_lock(sid: int, row_id: int, field: str) -> dict:
     return {"revision": revision, "locked": False}
 
 
+# ---------------------------------------------------------------- 隔离/恢复
+@app.post("/api/sessions/{sid}/quarantines")
+def add_quarantine(sid: int, body: QuarantineIn) -> dict:
+    data = db.get_session(sid)
+    if data is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+    if not any(r["row_id"] == body.row_id for r in data["rows"]):
+        raise HTTPException(status_code=400, detail="row_id 不存在。")
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="隔离原因不能为空。")
+    db.add_quarantine(sid, body.row_id, reason)
+    # 隔离状态变化：修订号 +1，旧确认立即作废，进行中的旧求解结果不得发布为当前方案。
+    revision = db.bump_revision(sid)
+    return {"revision": revision, "quarantined": True, "row_id": body.row_id}
+
+
+@app.delete("/api/sessions/{sid}/quarantines/{row_id}")
+def restore_quarantine(sid: int, row_id: int) -> dict:
+    if db.get_session(sid) is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+    removed = db.delete_quarantine(sid, row_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="该行未被隔离。")
+    # 恢复同样使旧确认/下载失效；该行的原核实值仍在 locks 表中，随下次求解重新生效。
+    revision = db.bump_revision(sid)
+    return {"revision": revision, "quarantined": False, "row_id": row_id}
+
+
 # ---------------------------------------------------------------- 触发求解
 @app.post("/api/sessions/{sid}/solve")
 def trigger_solve(sid: int) -> dict:
@@ -267,6 +307,11 @@ def confirm_solution(sid: int) -> dict:
             status_code=409,
             detail="当前核实值下无解，不存在可确认的修复方案。",
         )
+    if solution["status"] == "empty":
+        raise HTTPException(
+            status_code=409,
+            detail="全部行均已隔离，不存在可确认的修复方案（空方案不可确认）。",
+        )
     if solution["status"] != "optimal" or not solution["objective_proven"]:
         raise HTTPException(
             status_code=409,
@@ -300,10 +345,14 @@ def download_csv(sid: int) -> Response:
         (c["row_id"], c["fld"]): c["proposed"]
         for c in solution["payload"]["cells"]
     }
+    quarantined_ids = {q["row_id"] for q in data["quarantines"]}
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["行号", "植株号", "托盘号", "品种", "温室", "株高"])
+    # 隔离行不进入修复 CSV；原始行仍完整保留在会话中，恢复后可再次参与。
     for r in data["rows"]:
+        if r["row_id"] in quarantined_ids:
+            continue
         writer.writerow(
             [
                 r["line_no"],
@@ -349,7 +398,8 @@ def _run_job(sid: int, job_id: int, revision: int) -> None:
             )
             for l in data["locks"]
         ]
-        result = solve(data["rows"], data["pairs"], locks)
+        quarantined_ids = [q["row_id"] for q in data["quarantines"]]
+        result = solve(data["rows"], data["pairs"], locks, quarantined_ids)
         # 迟到结果保护：写入前再次核对版本与作业状态。
         latest = db.get_job(job_id)
         if (

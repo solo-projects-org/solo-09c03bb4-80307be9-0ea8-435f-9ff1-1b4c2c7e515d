@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS locks (
     created_at TEXT NOT NULL,
     UNIQUE(session_id, row_id, field)
 );
+CREATE TABLE IF NOT EXISTS quarantines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    row_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, row_id)
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES sessions(id),
@@ -164,6 +172,11 @@ def get_session(sid: int) -> Optional[dict]:
             "SELECT row_id, field, value, source FROM locks WHERE session_id=? ORDER BY id",
             (sid,),
         ).fetchall()
+        quarantines = conn.execute(
+            "SELECT row_id, reason, created_at FROM quarantines "
+            "WHERE session_id=? ORDER BY id",
+            (sid,),
+        ).fetchall()
         job = conn.execute(
             "SELECT id, status FROM jobs WHERE session_id=? ORDER BY id DESC LIMIT 1",
             (sid,),
@@ -182,6 +195,7 @@ def get_session(sid: int) -> Optional[dict]:
             "rows": [dict(r) for r in rows],
             "pairs": [(p["variety"], p["house"]) for p in pairs],
             "locks": [dict(x) for x in locks],
+            "quarantines": [dict(x) for x in quarantines],
             "job": dict(job) if job else None,
             "solution": dict(sol) if sol else None,
             "confirmation": dict(conf) if conf else None,
@@ -220,6 +234,28 @@ def delete_lock(sid: int, row_id: int, field: str) -> int:
         cur = conn.execute(
             "DELETE FROM locks WHERE session_id=? AND row_id=? AND field=?",
             (sid, row_id, field),
+        )
+        return cur.rowcount
+
+
+def add_quarantine(sid: int, row_id: int, reason: str) -> None:
+    """隔离一行（记录原因）。已隔离时更新原因与时间，原始行与核实值均不删除。"""
+    with _write_lock, get_conn() as conn:
+        conn.execute(
+            """INSERT INTO quarantines(session_id, row_id, reason, created_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(session_id, row_id)
+               DO UPDATE SET reason=excluded.reason, created_at=excluded.created_at""",
+            (sid, row_id, reason, _now()),
+        )
+
+
+def delete_quarantine(sid: int, row_id: int) -> int:
+    """恢复一行：仅移除隔离标记，原表行与该行列核实值原样保留并重新生效。"""
+    with _write_lock, get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM quarantines WHERE session_id=? AND row_id=?",
+            (sid, row_id),
         )
         return cur.rowcount
 

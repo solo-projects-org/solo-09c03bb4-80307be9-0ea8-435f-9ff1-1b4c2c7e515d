@@ -60,7 +60,7 @@ def wait_solution(client, sid, timeout=20.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         d = client.get(f"/api/sessions/{sid}").json()
-        if d["solution_status"] in ("optimal", "feasible", "infeasible", "failed"):
+        if d["solution_status"] in ("optimal", "feasible", "infeasible", "failed", "empty"):
             if not (d["job_status"] in ("pending", "running")):
                 return d
         time.sleep(0.1)
@@ -286,3 +286,196 @@ def test_failed_input_keeps_session_listing(client):
     d = client.get(f"/api/sessions/{sid}").json()
     # 求解后原表行数与内容不变
     assert [r["line_no"] for r in d["rows"]] == ["1", "2", "3"]
+
+
+# ---------------------------------------------------------------- 隔离/恢复
+def test_quarantine_requires_reason_and_existing_row(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    r = client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 2, "reason": ""},
+    )
+    assert r.status_code == 422  # pydantic 校验（空原因）
+    r = client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 99, "reason": "混入其他批次"},
+    )
+    assert r.status_code == 400
+    r = client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 2, "reason": "混入其他批次"},
+    )
+    assert r.status_code == 200 and r.json()["quarantined"] is True
+    d = client.get(f"/api/sessions/{sid}").json()
+    row2 = next(r for r in d["rows"] if r["row_id"] == 2)
+    assert row2["quarantined"] and row2["quarantine_reason"] == "混入其他批次"
+    assert d["quarantined_count"] == 1 and d["active_count"] == 2
+    assert d["quarantines"][0]["row_id"] == 2
+
+
+def test_quarantine_invalidates_confirmation_and_download(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    client.post(f"/api/sessions/{sid}/confirm")
+    assert client.get(f"/api/sessions/{sid}/download").status_code == 200
+
+    r = client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 2, "reason": "其他批次观测"},
+    )
+    assert r.status_code == 200
+    d = client.get(f"/api/sessions/{sid}").json()
+    assert d["revision"] == 2
+    assert d["solution_stale"] is True and d["confirmed"] is False
+    # 旧确认立即失效：确认与下载都被拒绝
+    assert client.post(f"/api/sessions/{sid}/confirm").status_code == 409
+    assert client.get(f"/api/sessions/{sid}/download").status_code == 409
+
+
+def test_quarantine_recalc_excludes_row_and_download_skips_it(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    # 隔离原本需要修复的行2（品种 V2 非法），剩余两行 0 改动
+    client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 2, "reason": "其他批次"},
+    )
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert d["solution_status"] == "optimal"
+    assert d["solution_stale"] is False
+    assert d["total_changes"] == 0
+    assert {c["row_id"] for c in d["cells"]} == {1, 3}
+    # 原表三行仍全部留存
+    assert len(d["rows"]) == 3
+    assert client.post(f"/api/sessions/{sid}/confirm").status_code == 200
+    r = client.get(f"/api/sessions/{sid}/download")
+    assert r.status_code == 200
+    text = r.content.decode("utf-8-sig")
+    data_lines = [ln for ln in text.strip().split("\n")[1:]]
+    # 修复 CSV 只含当前有效行（行1、行3），隔离行2 不进入
+    assert len(data_lines) == 2
+    assert all(not ln.startswith("2,") for ln in data_lines)
+    assert any(ln.startswith("1,") for ln in data_lines)
+    assert any(ln.startswith("3,") for ln in data_lines)
+
+
+def test_inflight_old_solve_cannot_publish_after_quarantine(client):
+    # 上传后立即隔离：首个作业基于旧修订号，结束时必须被标记 superseded，
+    # 且绝不能把旧方案写成当前方案。
+    info = upload(client)
+    sid = info["session_id"]
+    client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 1, "reason": "待现场核实"},
+    )
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{info['job_id']}").json()
+        if job["status"] in ("done", "superseded", "error"):
+            first_status = job["status"]
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("首个作业未结束")
+    assert first_status == "superseded"
+    # 重新求解：当前方案只含有效行，revision 与当前一致
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert d["solution_status"] == "optimal" and d["solution_stale"] is False
+    assert {c["row_id"] for c in d["cells"]} == {2, 3}
+
+
+def test_restore_revives_row_and_its_locks(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    # 先给行1 品种上锁，再隔离行1
+    client.post(
+        f"/api/sessions/{sid}/locks",
+        json={"row_id": 1, "field": "variety", "value": "V1", "source": "original"},
+    )
+    client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 1, "reason": "现场核实中"},
+    )
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert {c["row_id"] for c in d["cells"]} == {2, 3}
+    # 锁仍在持久层保留
+    assert any(l["row_id"] == 1 for l in d["locks"])
+
+    # 恢复：隔离标记移除、修订号递增、旧确认再次失效
+    r = client.delete(f"/api/sessions/{sid}/quarantines/1")
+    assert r.status_code == 200 and r.json()["quarantined"] is False
+    d = client.get(f"/api/sessions/{sid}").json()
+    assert d["quarantined_count"] == 0
+    row1 = next(x for x in d["rows"] if x["row_id"] == 1)
+    assert row1["quarantined"] is False
+    # 恢复不存在的隔离行 -> 404
+    assert client.delete(f"/api/sessions/{sid}/quarantines/2").status_code == 404
+
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert d["solution_status"] == "optimal"
+    # 原核实值重新生效：行1 品种格仍为 locked V1
+    locked_cell = next(
+        c for c in d["cells"] if c["row_id"] == 1 and c["field"] == "variety"
+    )
+    assert locked_cell["locked"] and locked_cell["locked_value"] == "V1"
+    assert {c["row_id"] for c in d["cells"]} == {1, 2, 3}
+
+
+def test_all_quarantined_empty_solution_not_confirmable(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    for rid in (1, 2, 3):
+        client.post(
+            f"/api/sessions/{sid}/quarantines",
+            json={"row_id": rid, "reason": f"行{rid}待核实"},
+        )
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert d["solution_status"] == "empty"
+    assert d["cells"] == [] and d["active_count"] == 0
+    # 空方案不可确认，下载同样被门控
+    assert client.post(f"/api/sessions/{sid}/confirm").status_code == 409
+    assert client.get(f"/api/sessions/{sid}/download").status_code == 409
+    # 原表三行依旧留存
+    assert len(d["rows"]) == 3
+    # 恢复一行后重新可解、可确认
+    client.delete(f"/api/sessions/{sid}/quarantines/2")
+    r = client.post(f"/api/sessions/{sid}/solve")
+    wait_job(client, r.json()["job_id"])
+    d = wait_solution(client, sid)
+    assert d["solution_status"] == "optimal"
+    assert {c["row_id"] for c in d["cells"]} == {2}
+
+
+def test_re_quarantine_same_row_updates_reason_and_bumps_revision(client):
+    info = upload(client)
+    sid = info["session_id"]
+    wait_solution(client, sid)
+    client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 3, "reason": "原因A"},
+    )
+    r = client.post(
+        f"/api/sessions/{sid}/quarantines",
+        json={"row_id": 3, "reason": "原因B（补充）"},
+    )
+    assert r.status_code == 200
+    d = client.get(f"/api/sessions/{sid}").json()
+    assert d["quarantined_count"] == 1
+    row3 = next(x for x in d["rows"] if x["row_id"] == 3)
+    assert row3["quarantine_reason"] == "原因B（补充）"

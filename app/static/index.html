@@ -54,6 +54,13 @@
   .b-ambiguous_keep { background:var(--green-bg); color:var(--green); }
   .b-ambiguous_change { background:var(--amber-bg); color:var(--amber); }
   .b-locked { background:var(--purple-bg); color:var(--purple); }
+  .b-quarantined { background:var(--red-bg); color:var(--red); }
+  .b-active { background:var(--gray-bg); color:var(--muted); }
+  tr.row-quarantined { background:#faf3f3; }
+  tr.row-quarantined td { color:var(--muted); }
+  .qbox { display:flex; flex-direction:column; gap:5px; min-width:190px; }
+  .qbox input[type=text] { min-width:170px; padding:5px 8px; }
+  .qreason { font-size:12px; color:var(--red); line-height:1.5; }
   .cellbox { display:flex; flex-direction:column; gap:4px; min-width:150px; }
   .cellbox .vals { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   select.cand { min-width:110px; padding:5px 8px; }
@@ -63,6 +70,7 @@
   .st-optimal { background:var(--green-bg); color:var(--green); }
   .st-feasible { background:var(--amber-bg); color:var(--amber); }
   .st-infeasible { background:var(--red-bg); color:var(--red); }
+  .st-empty { background:var(--amber-bg); color:var(--amber); }
   .st-pending,.st-running { background:var(--amber-bg); color:var(--amber); }
   .st-failed,.st-error,.st-superseded { background:var(--red-bg); color:var(--red); }
   .stale-banner { background:var(--amber-bg); color:var(--amber); border:1px solid #fde68a;
@@ -125,11 +133,12 @@
     </div>
     <div class="meta" id="metaBar"></div>
     <div class="stale-banner" id="staleBanner">
-      核实值已变化，当前展示的是旧方案，<b>已禁止确认/下载</b>。请点击「重新求解」获取新版本最优方案。
+      核实值或隔离状态已变化，当前展示的是旧方案，<b>已禁止确认/下载</b>。请点击「重新求解」获取新版本方案。
     </div>
     <div class="alert" id="sessionAlert"></div>
     <div id="conflictPanel"></div>
     <div class="legend" style="margin:10px 0;">
+      <span class="badge b-quarantined">已隔离（不参与求解与下载）</span>
       <span class="badge b-locked">已锁定核实值</span>
       <span class="badge b-fixed_change">所有最优解都必须改成同一值</span>
       <span class="badge b-ambiguous_change">必须改，但最优新值不唯一</span>
@@ -242,7 +251,7 @@ function renderSession() {
   $("metaBar").innerHTML = `
     <span>会话 <b>#${d.id}</b></span>
     <span>版本 <b>rev ${d.revision}</b></span>
-    <span>数据行 <b>${d.row_count}</b></span>
+    <span>数据行 <b>${d.row_count}</b>（有效 <b>${d.active_count}</b> / 已隔离 <b>${d.quarantined_count}</b>）</span>
     <span>品种 <b>${d.variety_count}</b> / 温室 <b>${d.house_count}</b></span>
     <span>核实值 <b>${d.locked_count}</b></span>
     <span>方案状态 ${statusPill}</span>
@@ -256,25 +265,28 @@ function renderSession() {
   $("confirmBtn").disabled = !canConfirm;
   $("downloadBtn").disabled = !d.confirmed || stale;
   $("solveHint").textContent = running
-    ? "求解进行中，期间仍可修改核实值；迟到的旧结果不会替换新方案。"
-    : (stale ? "方案已过期：锁定变化已立即禁止确认旧方案，请重新求解。" : "");
+    ? "求解进行中，期间仍可修改核实值或隔离状态；迟到的旧结果不会替换新方案。"
+    : (stale ? "方案已过期：核实值/隔离变化已立即禁止确认旧方案，请重新求解。" : "");
 }
 
 function renderTable() {
   const d = session;
   const head = $("tableHead");
-  head.innerHTML = ["行号","植株号","托盘号","品种（原 → 方案）","温室（原 → 方案）","株高"].map(h => `<th>${h}</th>`).join("");
+  head.innerHTML = ["行号","植株号","托盘号","品种（原 → 方案）","温室（原 → 方案）","株高","状态","隔离/恢复"].map(h => `<th>${h}</th>`).join("");
   const cellMap = {};
   d.cells.forEach(c => { cellMap[`${c.row_id}:${c.field}`] = c; });
   const body = $("tableBody");
   body.innerHTML = "";
   d.rows.forEach(r => {
     const tr = document.createElement("tr");
+    if (r.quarantined) tr.className = "row-quarantined";
     tr.innerHTML = `
       <td>${esc(r.line_no)}</td><td>${esc(r.plant_no)}</td><td>${esc(r.tray_no)}</td>
-      <td>${cellHtml(cellMap[`${r.row_id}:variety`], r.variety_original, "variety", r.row_id)}</td>
-      <td>${cellHtml(cellMap[`${r.row_id}:house`], r.house_original, "house", r.row_id)}</td>
-      <td>${esc(r.height)}</td>`;
+      <td>${cellHtml(cellMap[`${r.row_id}:variety`], r.variety_original, "variety", r)}</td>
+      <td>${cellHtml(cellMap[`${r.row_id}:house`], r.house_original, "house", r)}</td>
+      <td>${esc(r.height)}</td>
+      <td>${statusHtml(r)}</td>
+      <td>${quarantineHtml(r)}</td>`;
     body.appendChild(tr);
   });
   // 绑定下拉/按钮事件
@@ -283,7 +295,34 @@ function renderTable() {
   });
 }
 
-function cellHtml(cell, original, field, rowId) {
+function statusHtml(r) {
+  if (r.quarantined) {
+    return `<span class="badge b-quarantined">已隔离</span>`;
+  }
+  return `<span class="badge b-active">有效</span>`;
+}
+
+function quarantineHtml(r) {
+  if (r.quarantined) {
+    return `<div class="qbox">
+      <div class="qreason">原因：${esc(r.quarantine_reason)}</div>
+      <button class="ghost small" data-act="restore" data-row="${r.row_id}">恢复该行</button>
+    </div>`;
+  }
+  return `<div class="qbox">
+    <input type="text" class="qreason-input" placeholder="隔离原因（必填）"
+      data-act="quarantine-reason" data-row="${r.row_id}" maxlength="256" />
+    <button class="small" style="background:var(--red);" data-act="quarantine" data-row="${r.row_id}">隔离该行</button>
+  </div>`;
+}
+
+function cellHtml(cell, original, field, row) {
+  const rowId = row.row_id;
+  if (row.quarantined) {
+    // 隔离行：原值留存展示，不提供锁定/候选操作，也不显示旧方案值。
+    return `<div class="cellbox"><div class="vals"><span class="orig">${esc(original)}</span>
+      <span class="hint">（已隔离，不参与求解；原值与核实值留存）</span></div></div>`;
+  }
   if (!cell) return `<span class="orig">${esc(original)}</span> <span class="hint">（待求解）</span>`;
   const changed = cell.proposed && cell.proposed !== original;
   const origHtml = changed
@@ -310,10 +349,12 @@ function cellHtml(cell, original, field, rowId) {
 function renderConflicts() {
   const d = session;
   const panel = $("conflictPanel");
-  if (!d.conflicts || d.conflicts.length === 0 || d.solution_stale) { panel.innerHTML = ""; return; }
-  if (d.solution_status === "infeasible") {
+  if (d.solution_status === "infeasible" && !d.solution_stale) {
     panel.innerHTML = `<div class="conflict-box"><b>无解：以下核实值与规则相互冲突（锁定值未被改动）</b>
       <ul>${d.conflicts.map(c => `<li><b>${c.kind === "lock" ? "核实值" : "规则"}</b>：${esc(c.description)}</li>`).join("")}</ul></div>`;
+  } else if (d.solution_status === "empty") {
+    panel.innerHTML = `<div class="conflict-box" style="border-color:#fde68a;background:var(--amber-bg);color:var(--amber);">
+      全部数据行均已隔离：没有可参与求解的有效行，空方案不可确认。请恢复至少一行后重新求解。</div>`;
   } else if (d.solution_status === "failed") {
     panel.innerHTML = `<div class="conflict-box">求解失败，原表与核实值均已保留，可重试「重新求解」。</div>`;
   } else if (d.solution_status === "feasible") {
@@ -326,10 +367,23 @@ function renderConflicts() {
 
 async function handleCellAction(el) {
   const act = el.dataset.act, rowId = Number(el.dataset.row), field = el.dataset.field;
+  if (act === "quarantine-reason") return; // 输入框只用于收集原因，不触发请求
   const cell = session.cells.find(c => c.row_id === rowId && c.field === field);
   const row = session.rows.find(r => r.row_id === rowId);
   try {
-    if (act === "unlock") {
+    if (act === "quarantine") {
+      const input = document.querySelector(`input[data-act="quarantine-reason"][data-row="${rowId}"]`);
+      const reason = input ? input.value.trim() : "";
+      if (!reason) { showAlert($("sessionAlert"), "请填写隔离原因后再隔离该行。"); return; }
+      const r = await fetch(`/api/sessions/${session.id}/quarantines`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ row_id: rowId, reason }),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || "隔离失败");
+    } else if (act === "restore") {
+      const r = await fetch(`/api/sessions/${session.id}/quarantines/${rowId}`, { method: "DELETE" });
+      if (!r.ok) throw new Error((await r.json()).detail || "恢复失败");
+    } else if (act === "unlock") {
       const r = await fetch(`/api/sessions/${session.id}/locks/${rowId}/${field}`, { method: "DELETE" });
       if (!r.ok) throw new Error((await r.json()).detail);
     } else if (act === "lock-original") {
@@ -388,7 +442,7 @@ function startPolling(sid) {
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
 function statusText(s) {
-  return { optimal: "已证最优方案", feasible: "可行但未证最优（不可确认）", infeasible: "无解（冲突）", failed: "求解失败",
+  return { optimal: "已证最优方案", feasible: "可行但未证最优（不可确认）", infeasible: "无解（冲突）", empty: "全部行已隔离（空方案不可确认）", failed: "求解失败",
            pending: "排队中", running: "求解中", done: "完成", error: "错误", superseded: "已被新版本取代" }[s] || s;
 }
 function esc(s) {
